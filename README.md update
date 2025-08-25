@@ -1,0 +1,1241 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+OpenPlus Web (single file) — Google-like UI • Termux friendly
+
+Updates delivered (Option A):
+1) **Mobile parity:** Left & right rails are now visible on mobile (People also ask, People also search for, Map, Weather, About, AI Lady Voice). We removed the rule that hid sidebars on small screens.
+2) Results page layout mirrors Google-style sections (top stories, result cards, PAA/PAS, right rail).
+3) Videos tab uses a vertical stacked list.
+4) Search bars return real results via DuckDuckGo endpoints (web/images/videos/news).
+
+Run:
+  pip install flask requests beautifulsoup4
+  python3 openplus.py --host 0.0.0.0 --port 5000
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlparse, quote_plus
+
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify, redirect, render_template_string, request, url_for
+
+# -------------------- Config --------------------
+
+DEFAULT_UA = (
+    "openplus-web/2.1 (Termux) "
+    "+https://github.com/termux-user; respectful-user-agent"
+)
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": DEFAULT_UA, "Accept-Language": "en;q=0.9"})
+
+BASE_DIR = os.path.expanduser("~/.openplus_web")
+os.makedirs(BASE_DIR, exist_ok=True)
+CACHE_DB = os.path.join(BASE_DIR, "openplus_cache.db")
+
+# TTLs (seconds)
+TTL_SEARCH = 60 * 60 * 12
+TTL_GEO = 60 * 60 * 24 * 7
+TTL_WEATHER = 60 * 15
+TTL_MEDIA = 60 * 60 * 6
+TTL_SUGG = 60 * 60 * 24
+
+# -------------------- DB --------------------
+
+
+def db_exec(sql: str, params: Tuple = (), fetch: bool = False):
+    con = sqlite3.connect(CACHE_DB)
+    cur = con.cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall() if fetch else None
+    con.commit()
+    con.close()
+    return rows
+
+
+def _db_init():
+    db_exec(
+        """CREATE TABLE IF NOT EXISTS search_cache (q TEXT PRIMARY KEY, result_json TEXT, ts INTEGER)"""
+    )
+    db_exec(
+        """CREATE TABLE IF NOT EXISTS geo_cache (q TEXT PRIMARY KEY, result_json TEXT, ts INTEGER)"""
+    )
+    db_exec(
+        """CREATE TABLE IF NOT EXISTS weather_cache (key TEXT PRIMARY KEY, result_json TEXT, ts INTEGER)"""
+    )
+    db_exec(
+        """CREATE TABLE IF NOT EXISTS media_cache (key TEXT PRIMARY KEY, result_json TEXT, ts INTEGER)"""
+    )
+
+
+_db_init()
+
+# -------------------- Utils --------------------
+
+
+def now_s() -> int:
+    return int(time.time())
+
+
+def domain_from_url(u: str) -> str:
+    try:
+        return urlparse(u).netloc.replace("www.", "")
+    except Exception:
+        return ""
+
+
+def _unwrap_ddg_redirect(href: str) -> str:
+    try:
+        if "duckduckgo.com/l/?" in href:
+            qs = parse_qs(urlparse(href).query)
+            if "uddg" in qs and qs["uddg"]:
+                return unquote(qs["uddg"][0])
+        return href
+    except Exception:
+        return href
+
+
+def _abs_url(src: Optional[str]) -> Optional[str]:
+    if not src:
+        return None
+    if src.startswith("//"):
+        return "https:" + src
+    return src
+
+
+def _html_text(el) -> str:
+    try:
+        return " ".join((el or "").get_text(" ", strip=True).split())
+    except Exception:
+        return str(el or "")
+
+
+def _mget(key: str, ttl: int) -> Optional[Any]:
+    row = db_exec("SELECT result_json, ts FROM media_cache WHERE key=?", (key,), fetch=True)
+    if not row:
+        return None
+    body, ts = row[0]
+    if now_s() - int(ts) > ttl:
+        return None
+    try:
+        return json.loads(body)
+    except Exception:
+        return None
+
+
+def _mset(key: str, data: Any):
+    db_exec(
+        "REPLACE INTO media_cache (key, result_json, ts) VALUES (?, ?, ?)",
+        (key, json.dumps(data), now_s()),
+    )
+
+
+def _cache_get(table: str, key: str, ttl: int) -> Optional[Any]:
+    row = db_exec(f"SELECT result_json, ts FROM {table} WHERE q=?", (key,), fetch=True)
+    if not row:
+        return None
+    result_json, ts = row[0]
+    if now_s() - int(ts) > ttl:
+        return None
+    try:
+        return json.loads(result_json)
+    except Exception:
+        return None
+
+
+def _cache_set(table: str, key: str, data: Any):
+    db_exec(
+        f"REPLACE INTO {table} (q, result_json, ts) VALUES (?, ?, ?)",
+        (key, json.dumps(data), now_s()),
+    )
+
+
+def fetch_text(url: str, timeout: int = 6) -> Optional[str]:
+    try:
+        r = SESSION.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.text
+    except Exception:
+        return None
+
+
+# -------------------- DuckDuckGo core (web) --------------------
+
+
+def ddg_search(query: str, limit: int = 10) -> List[Dict[str, str]]:
+    if not query.strip():
+        return []
+    key = f"web::{query}::{limit}"
+    cached = _mget(key, TTL_MEDIA)
+    if cached:
+        return cached[:limit]
+    try:
+        url = "https://html.duckduckgo.com/html/"
+        r = SESSION.get(url, params={"q": query, "ia": "web"}, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        out: List[Dict[str, str]] = []
+        for res in soup.select(".result, .results_links, .nrn-react-div"):
+            a = res.select_one("a.result__a") or res.select_one("a[href]")
+            if not a:
+                continue
+            href = _unwrap_ddg_redirect(a.get("href", "").strip())
+            title = _html_text(a)
+            snippet_el = (
+                res.select_one(".result__snippet") or res.select_one(".result__body") or res
+            )
+            snippet = _html_text(snippet_el)
+            domain = domain_from_url(href)
+            if href and title:
+                out.append(
+                    {"title": title, "url": href, "snippet": snippet, "domain": domain}
+                )
+            if len(out) >= max(10, limit):
+                break
+        _mset(key, out)
+        return out[:limit]
+    except Exception:
+        return []
+
+
+# -------------------- Featured (Wiki/OG) --------------------
+
+
+def wiki_summary_and_thumb(page_url: str) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if "wikipedia.org/wiki/" not in page_url:
+            return None, None
+        title = urlparse(page_url).path.split("/wiki/", 1)[1]
+        api = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+        r = SESSION.get(api, timeout=10)
+        if r.status_code == 200:
+            j = r.json()
+            return j.get("extract"), (j.get("thumbnail") or {}).get("source")
+    except Exception:
+        pass
+    return None, None
+
+
+def page_og_image(url: str) -> Optional[str]:
+    html = fetch_text(url, timeout=6)
+    if not html:
+        return None
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        og = soup.find("meta", property="og:image") or soup.find(
+            "meta", attrs={"name": "og:image"}
+        )
+        if og and og.get("content"):
+            return _abs_url(og.get("content"))
+    except Exception:
+        pass
+    return None
+
+
+def ddg_image_preview(query: str) -> Optional[str]:
+    try:
+        r = SESSION.get(
+            "https://duckduckgo.com/",
+            params={"q": query, "iax": "images", "ia": "images"},
+            timeout=10,
+        )
+        soup = BeautifulSoup(r.text, "html.parser")
+        img = soup.select_one("img.tile--img__img, img.js-lazyload, img")
+        if img and (img.get("src") or img.get("data-src")):
+            return _abs_url(img.get("src") or img.get("data-src"))
+    except Exception:
+        return None
+    return None
+
+
+def pick_featured(query: str, results: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+    if not results:
+        return None
+    wiki_candidate = next(
+        (r for r in results if "wikipedia.org" in r["url"]),
+        results[0],
+    )
+    summary, img = wiki_summary_and_thumb(wiki_candidate["url"])
+    if not img:
+        img = page_og_image(wiki_candidate["url"]) or ddg_image_preview(query)
+    return {
+        "title": wiki_candidate["title"],
+        "url": wiki_candidate["url"],
+        "snippet": summary or wiki_candidate.get("snippet", ""),
+        "image": img,
+        "domain": domain_from_url(wiki_candidate["url"]),
+    }
+
+
+# -------------------- DDG vqd + JSON endpoints (images/videos/news) --------------------
+
+_VQD_RE = re.compile(r"vqd='([^']+)'|vqd=\"([^\"]+)\"")
+
+
+def _ddg_vqd(query: str, ia: str = "web") -> Optional[str]:
+    try:
+        r = SESSION.get("https://duckduckgo.com/", params={"q": query, "ia": ia}, timeout=12)
+        m = _VQD_RE.search(r.text)
+        if not m:
+            return None
+        return m.group(1) or m.group(2)
+    except Exception:
+        return None
+
+
+def _ddg_follow_next(next_url: str) -> Optional[Dict[str, Any]]:
+    try:
+        if not next_url:
+            return None
+        if next_url.startswith("//"):
+            next_url = "https:" + next_url
+        elif next_url.startswith("/"):
+            next_url = "https://duckduckgo.com" + next_url
+        r = SESSION.get(next_url, timeout=15)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def ddg_images(query: str, limit: int = 500) -> List[Dict[str, str]]:
+    key = f"img::{query}::{limit}"
+    cached = _mget(key, TTL_MEDIA)
+    if cached:
+        return cached[:limit]
+    vqd = _ddg_vqd(query, "images")
+    if not vqd:
+        return []
+    out: List[Dict[str, str]] = []
+    try:
+        r = SESSION.get(
+            "https://duckduckgo.com/i.js",
+            params={"l": "us-en", "o": "json", "q": query, "vqd": vqd, "f": ",,,", "p": "1"},
+            timeout=15,
+        )
+        j = r.json() if r.status_code == 200 else {}
+    except Exception:
+        j = {}
+
+    def consume(block):
+        nonlocal out
+        for it in (block or {}).get("results", []):
+            src = it.get("image") or it.get("thumbnail") or it.get("thumbnailUrl") or it.get("thumb")
+            thumb = it.get("thumbnail") or it.get("thumbnailUrl") or it.get("thumb") or src
+            page = it.get("url") or it.get("source")
+            title = it.get("title") or it.get("alt") or query
+            domain = domain_from_url(page or "")
+            if src:
+                out.append(
+                    {
+                        "src": _abs_url(src),
+                        "thumb": _abs_url(thumb),
+                        "alt": title,
+                        "page": page,
+                        "domain": domain,
+                    }
+                )
+            if len(out) >= limit:
+                break
+
+    consume(j)
+    next_url = (j or {}).get("next")
+    while next_url and len(out) < limit:
+        block = _ddg_follow_next(next_url)
+        if not block:
+            break
+        consume(block)
+        next_url = block.get("next")
+
+    if not out:
+        preview = ddg_image_preview(query)
+        if preview:
+            out = [{"src": preview, "thumb": preview, "alt": query, "page": None, "domain": ""}]
+    _mset(key, out)
+    return out[:limit]
+
+
+def ddg_videos(query: str, limit: int = 500) -> List[Dict[str, str]]:
+    key = f"vid::{query}::{limit}"
+    cached = _mget(key, TTL_MEDIA)
+    if cached:
+        return cached[:limit]
+    vqd = _ddg_vqd(query, "videos")
+    if not vqd:
+        return []
+    out: List[Dict[str, str]] = []
+    try:
+        r = SESSION.get(
+            "https://duckduckgo.com/v.js",
+            params={"l": "us-en", "o": "json", "q": query, "vqd": vqd},
+            timeout=15,
+        )
+        j = r.json() if r.status_code == 200 else {}
+    except Exception:
+        j = {}
+
+    def consume(block):
+        nonlocal out
+        for it in (block or {}).get("results", []):
+            url = it.get("content") or it.get("url") or it.get("playback") or it.get("video")
+            thumb = it.get("thumbnail") or it.get("image") or it.get("thumb")
+            title = it.get("title") or it.get("name") or query
+            source = it.get("domain") or domain_from_url(url or "")
+            entry = {
+                "title": title,
+                "url": url,
+                "thumb": _abs_url(thumb) if thumb else None,
+                "domain": source,
+            }
+            out.append(entry)
+            if len(out) >= limit:
+                break
+
+    consume(j)
+    next_url = (j or {}).get("next")
+    while next_url and len(out) < limit:
+        block = _ddg_follow_next(next_url)
+        if not block:
+            break
+        consume(block)
+        next_url = block.get("next")
+
+    # Best-effort thumbnails when missing
+    for v in out:
+        if not v.get("thumb") and v.get("url"):
+            try:
+                html = fetch_text(v["url"], timeout=5)
+                if html:
+                    soup = BeautifulSoup(html, "html.parser")
+                    og = soup.find("meta", property="og:image") or soup.find(
+                        "meta", attrs={"name": "og:image"}
+                    )
+                    if og and og.get("content"):
+                        v["thumb"] = _abs_url(og.get("content"))
+                        continue
+                    twitter = soup.find("meta", attrs={"name": "twitter:image"}) or soup.find(
+                        "meta", property="twitter:image"
+                    )
+                    if twitter and twitter.get("content"):
+                        v["thumb"] = _abs_url(twitter.get("content"))
+                        continue
+            except Exception:
+                pass
+
+    _mset(key, out)
+    return out[:limit]
+
+
+def ddg_news(query: str, limit: int = 20) -> List[Dict[str, str]]:
+    key = f"news::{query}::{limit}"
+    cached = _mget(key, TTL_MEDIA)
+    if cached:
+        return cached[:limit]
+    vqd = _ddg_vqd(query, "news")
+    if not vqd:
+        # Fallback to HTML
+        try:
+            tmp = []
+            r = SESSION.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query, "iar": "news", "ia": "news"},
+                timeout=12,
+            )
+            soup = BeautifulSoup(r.text, "html.parser")
+            for res in soup.select(".result--news, .result"):
+                a = res.select_one("a.result__a")
+                if not a:
+                    continue
+                href = _unwrap_ddg_redirect(a.get("href", ""))
+                title = _html_text(a)
+                src = res.select_one(".result__source__domain")
+                tmp.append(
+                    {
+                        "title": title,
+                        "url": href,
+                        "source": _html_text(src) if src else domain_from_url(href),
+                        "time": "",
+                        "thumb": None,
+                    }
+                )
+                if len(tmp) >= limit:
+                    break
+            _mset(key, tmp)
+            return tmp
+        except Exception:
+            return []
+    try:
+        r = SESSION.get(
+            "https://duckduckgo.com/news.js",
+            params={"l": "us-en", "o": "json", "q": query, "vqd": vqd},
+            timeout=12,
+        )
+        j = r.json() if r.status_code == 200 else {}
+    except Exception:
+        j = {}
+    out = []
+    for it in j.get("results", []):
+        title = it.get("title") or ""
+        url = it.get("url") or ""
+        source = it.get("source") or domain_from_url(url or "")
+        time_str = it.get("date") or it.get("relative_time") or ""
+        img = it.get("image") or it.get("thumbnail")
+        out.append(
+            {
+                "title": title,
+                "url": url,
+                "source": source,
+                "time": time_str,
+                "thumb": _abs_url(img) if img else None,
+            }
+        )
+        if len(out) >= limit:
+            break
+    _mset(key, out)
+    return out
+
+
+# -------------------- Suggestions --------------------
+
+
+def ddg_suggestions(query: str, limit: int = 12) -> List[str]:
+    key = f"sugg::{query}::{limit}"
+    cached = _mget(key, TTL_SUGG)
+    if cached:
+        return cached[:limit]
+    try:
+        r = SESSION.get(
+            "https://duckduckgo.com/ac/", params={"q": query, "type": "list"}, timeout=8
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        out = []
+        for item in data:
+            phrase = (item.get("phrase") if isinstance(item, dict) else str(item)).strip()
+            if phrase:
+                out.append(phrase)
+            if len(out) >= limit:
+                break
+        _mset(key, out)
+        return out
+    except Exception:
+        return []
+
+
+def build_people_also_ask(query: str, suggs: List[str], limit: int = 6) -> List[str]:
+    qs = [s for s in suggs if s.endswith("?")]
+    if len(qs) < 3:
+        base = query.strip().rstrip("?")
+        templates = ["What is {}", "Who is {}", "How to {}", "Why {}", "When {}", "Where {}"]
+        for t in templates:
+            qs.append((t.format(base)).strip() + "?")
+    seen, out = set(), []
+    for s in qs:
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+
+# -------------------- Geocode + Weather --------------------
+
+
+def geocode(query: str) -> Optional[Dict[str, Any]]:
+    cached = _cache_get("geo_cache", query, TTL_GEO)
+    if cached:
+        return cached
+    try:
+        r = SESSION.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1},
+            timeout=12,
+        )
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        if not j:
+            return None
+        item = j[0]
+        data = {
+            "name": item.get("display_name"),
+            "lat": float(item["lat"]),
+            "lon": float(item["lon"]),
+        }
+        _cache_set("geo_cache", query, data)
+        return data
+    except Exception:
+        return None
+
+
+def _w_get(key: str, ttl: int) -> Optional[Dict[str, Any]]:
+    row = db_exec("SELECT result_json, ts FROM weather_cache WHERE key=?", (key,), fetch=True)
+    if not row:
+        return None
+    result_json, ts = row[0]
+    if now_s() - int(ts) > ttl:
+        return None
+    try:
+        return json.loads(result_json)
+    except Exception:
+        return None
+
+
+def _w_set(key: str, data: Dict[str, Any]):
+    db_exec(
+        "REPLACE INTO weather_cache (key, result_json, ts) VALUES (?, ?, ?)",
+        (key, json.dumps(data), now_s()),
+    )
+
+
+def get_weather(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    cache_key = f"{round(lat,3)},{round(lon,3)}"
+    cached = _w_get(cache_key, TTL_WEATHER)
+    if cached:
+        return cached
+    try:
+        r = SESSION.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={"latitude": lat, "longitude": lon, "current_weather": "true", "timezone": "auto"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        cw = j.get("current_weather") or {}
+        data = {"temp": cw.get("temperature"), "wind": cw.get("windspeed"), "time": cw.get("time")}
+        _w_set(cache_key, data)
+        return data
+    except Exception:
+        return None
+
+
+# -------------------- Categories --------------------
+
+CATEGORIES: Dict[str, List[str]] = {
+    "news": ["bbc.com", "cnn.com", "reuters.com", "apnews.com", "aljazeera.com", "theguardian.com"],
+    "tech": ["theverge.com", "techcrunch.com", "wired.com", "arstechnica.com", "thenextweb.com", "engadget.com"],
+    "sports": ["espn.com", "skysports.com", "goal.com", "mlb.com", "nba.com", "nfl.com"],
+    "finance": ["bloomberg.com", "ft.com", "wsj.com", "marketwatch.com", "investopedia.com"],
+    "education": ["edx.org", "coursera.org", "khanacademy.org", "udemy.com", "academic.oup.com", "nature.com"],
+    "health": ["who.int", "cdc.gov", "nih.gov", "mayoclinic.org", "webmd.com", "healthline.com"],
+    "science": ["nature.com", "science.org", "sciencedaily.com", "arxiv.org", "nasa.gov", "esa.int"],
+    "movies": ["imdb.com", "rottentomatoes.com", "metacritic.com", "boxofficemojo.com", "letterboxd.com"],
+    "music": ["pitchfork.com", "rollingstone.com", "billboard.com", "allmusic.com", "genius.com"],
+    "gaming": ["ign.com", "gamespot.com", "pcgamer.com", "kotaku.com", "polygon.com"],
+    "business": ["hbr.org", "forbes.com", "entrepreneur.com", "inc.com", "fastcompany.com", "businessinsider.com"],
+    "ai": ["openai.com", "deepmind.com", "huggingface.co", "arxiv.org", "semianalysis.com"],
+    "programming": ["stackoverflow.com", "github.com", "docs.python.org", "developer.mozilla.org", "go.dev", "kotlinlang.org"],
+    "android": ["xda-developers.com", "androidpolice.com", "9to5google.com", "gsmarena.com"],
+    "apple": ["9to5mac.com", "macrumors.com", "apple.com", "imore.com"],
+    "security": ["krebsonsecurity.com", "bleepingcomputer.com", "darkreading.com", "thehackernews.com"],
+    "travel": ["lonelyplanet.com", "tripadvisor.com", "booking.com"],
+    "food": ["allrecipes.com", "seriouseats.com", "epicurious.com"],
+    "design": ["behance.net", "dribbble.com", "smashingmagazine.com", "awwwards.com"],
+    "cars": ["caranddriver.com", "motortrend.com", "topgear.com", "autocar.co.uk", "jalopnik.com"],
+    "crypto": ["cointelegraph.com", "coindesk.com", "theblock.co"],
+    "history": ["history.com", "britannica.com", "smithsonianmag.com", "nationalgeographic.com"],
+    "space": ["nasa.gov", "spacex.com", "space.com", "esa.int"],
+    "hardware": ["tomshardware.com", "anandtech.com", "notebookcheck.net"],
+}
+
+
+def category_aggregate(category: str, query: str = "", per_domain: int = 3, max_results: int = 50) -> List[Dict[str, str]]:
+    domains = CATEGORIES.get(category.lower())
+    if not domains:
+        return []
+    results: List[Dict[str, str]] = []
+    for d in domains:
+        q = f"site:{d} {query}".strip()
+        chunk = ddg_search(q, limit=per_domain)
+        for it in chunk:
+            it["source"] = d
+            results.append(it)
+            if len(results) >= max_results:
+                break
+        if len(results) >= max_results:
+            break
+    return results
+
+
+# -------------------- Flask app & Template --------------------
+
+app = Flask(__name__)
+
+# Google-like dark UI (home + results in same template)
+HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ 'OpenPlus' if not q else q ~ ' - OpenPlus' }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark">
+  <style>
+    :root{
+      --bg:#202124;--elev:#2b2c2f;--text:#e8eaed;--muted:#bdc1c6;--link:#8ab4f8;
+      --input:#303134;--border:#3c4043;--accent:#1a73e8;--ok:#34a853;--warn:#fbbc05;--danger:#ea4335;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    a{color:var(--link);text-decoration:none} a:hover{text-decoration:underline}
+    .spacer{flex:1}
+    /* Top bar */
+    .topbar{padding:.5rem 1rem;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg);z-index:50}
+    .topnav{display:flex;align-items:center;gap:1rem;max-width:1200px;margin:0 auto}
+    .topnav a{color:var(--text);opacity:.9}
+    .apps{width:36px;height:36px;border-radius:999px;display:grid;place-items:center;background:transparent;border:0;color:var(--muted)}
+    .apps:hover{background:var(--input)}
+    .dots{width:18px;height:18px;display:grid;grid-template-columns:repeat(3,1fr);gap:2px}
+    .dots span{width:4px;height:4px;background:var(--muted);border-radius:50%}
+    .avatar{width:36px;height:36px;border-radius:50%;background:#4a5568;display:grid;place-items:center;font-weight:700}
+
+    /* Home */
+    .home{display:grid;place-items:center;margin-top:14vh}
+    .logo{margin-bottom:1.5rem}
+    .logo svg{height:96px}
+    .search{width:min(92vw,640px)}
+    .box{display:flex;align-items:center;gap:.5rem;background:var(--input);border:1px solid var(--border);border-radius:999px;padding:.5rem .75rem;box-shadow:0 1px 2px rgba(0,0,0,.2),0 2px 8px rgba(0,0,0,.15)}
+    .box input{flex:1;background:transparent;color:var(--text);border:0;outline:0;font-size:1rem;padding:.35rem}
+    .ghost{border:0;background:transparent;color:var(--muted);padding:.25rem .5rem;border-radius:999px}
+    .ghost:hover{background:var(--elev)}
+    .center-btns{display:flex;gap:.75rem;justify-content:center;margin-top:1rem}
+    .btn{background:var(--elev);border:1px solid var(--border);color:var(--text);padding:.5rem 1rem;border-radius:6px}
+    .btn:hover{border-color:var(--muted)}
+
+    /* Results header */
+    .results-header{display:flex;gap:.75rem;align-items:center;padding:.5rem 1rem;background:var(--bg);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:45}
+    .brand svg{height:28px}
+    .head-search{flex:1}
+    .compact{border-radius:24px}
+
+    /* Tabs */
+    .tabs{display:flex;gap:.5rem;align-items:center;padding:.25rem 1rem;border-bottom:1px solid var(--border);position:sticky;top:56px;background:var(--bg);z-index:40}
+    .tab{background:transparent;border:0;color:var(--muted);padding:.5rem .75rem;border-radius:999px}
+    .tab:hover{background:var(--input)} .tab.active{color:var(--text);background:#1f2937;border:1px solid var(--border)}
+    .tools{margin-left:auto}
+
+    /* Grid */
+    .grid{display:grid;grid-template-columns:1fr;gap:1rem;padding:1rem;max-width:1200px;margin:0 auto}
+    .card{background:var(--elev);border:1px solid var(--border);border-radius:12px;padding:1rem}
+    .result{display:flex;gap:12px;align-items:flex-start;padding:10px;border-radius:10px;border:1px solid #0f0f0f}
+    .site-fav{width:48px;height:48px;border-radius:50%;object-fit:cover;background:#111}
+    .thumb{width:140px;height:90px;object-fit:cover;border-radius:8px}
+    .thumb-lg{width:100%;height:auto;border-radius:10px;margin-top:8px}
+    .small-fav{width:18px;height:18px;border-radius:4px;vertical-align:middle;margin-right:6px}
+    .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+    .chip{padding:6px 10px;background:#121212;border-radius:14px;border:1px solid #222;color:#ddd;cursor:pointer}
+    .media-grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(180px,1fr));gap:10px}
+    .media-item{background:#080808;border:1px solid #151515;border-radius:10px;overflow:hidden;display:flex;flex-direction:column}
+    .media-item img{width:100%;height:140px;object-fit:cover;display:block}
+    /* VIDEOS VERTICAL LIST */
+    .video-list{display:flex;flex-direction:column;gap:12px}
+    .video-card{display:flex;gap:12px;background:#0a0a0b;border:1px solid #151515;border-radius:12px;overflow:hidden}
+    .video-thumb{width:240px;aspect-ratio:16/9;object-fit:cover;display:block;background:#111}
+    .video-meta{padding:10px 10px 10px 0}.video-title{font-size:15px;line-height:1.3}
+    .video-source{color:#9a9a9a;font-size:12px;margin-top:6px}
+    .hint{color:var(--muted)}
+    .footer{margin-top:10vh;border-top:1px solid var(--border);background:var(--elev)}
+    .foot-row{padding:.75rem 1rem}
+    .country{color:var(--muted);border-bottom:1px solid var(--border)}
+    .links{display:flex;justify-content:space-between;flex-wrap:wrap;gap:.5rem}
+
+    /* Desktop: 3-column grid */
+    @media(min-width:768px){
+      .grid{grid-template-columns:240px 1fr 320px}
+    }
+    /* Mobile tweaks (keep sidebars visible) */
+    @media(max-width:767px){
+      .video-thumb{width:44vw}
+    }
+
+    :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  </style>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+{% if not q %}
+  <!-- HOME -->
+  <header class="topbar">
+    <nav class="topnav">
+      <a href="#">About</a><a href="#">Store</a><div class="spacer"></div>
+      <a href="{{ url_for('search', t='images') }}">Images</a><a href="#">Gmail</a>
+      <button class="apps" aria-label="Apps"><span class="dots"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></span></button>
+      <div class="avatar">OP</div>
+    </nav>
+  </header>
+  <main class="home">
+    <div class="logo" aria-hidden="true">
+      <svg width="220" height="72" viewBox="0 0 220 72" xmlns="http://www.w3.org/2000/svg">
+        <defs><style>.t{font:700 48px system-ui,Segoe UI,Roboto,Arial}</style></defs>
+        <text x="0" y="52" class="t" fill="#8ab4f8">Open</text>
+        <text x="125" y="52" class="t" fill="#34a853">P</text>
+        <text x="156" y="52" class="t" fill="#fbbc05">l</text>
+        <text x="168" y="52" class="t" fill="#ea4335">us</text>
+      </svg>
+    </div>
+    <form class="search" action="{{ url_for('search') }}" method="get" role="search" autocomplete="off">
+      <div class="box">
+        <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" style="fill:#bdc1c6"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.22C16 6.01 13.2 3.22 9.99 3.22S4 6.01 4 9.22s2.79 5.99 5.99 5.99a6.471 6.471 0 0 0 4.23-1.57l.27.28v.79l 4.25 4.25c.41.41 1.08.41 1.49 0 .41-.41.41-1.08 0-1.49L15.5 14zM6 9.22a3.99 3.99 0 1 1 7.98 0A3.99 3.99 0 0 1 6 9.22z"/></svg>
+        <input name="q" placeholder="Search OpenPlus or type a URL" autofocus>
+        <div>
+          <button type="button" class="ghost" title="Voice">🎤</button>
+          <button type="button" class="ghost" title="Image">📷</button>
+        </div>
+      </div>
+      <div class="center-btns">
+        <button class="btn" type="submit">OpenPlus Search</button>
+        <button class="btn" type="submit" formaction="{{ url_for('lucky') }}">I’m Feeling Lucky</button>
+      </div>
+    </form>
+    <div class="hint" style="margin-top:8px">Google offered in: हिन्दी বাংলা తెలుగు मराठी தமிழ் ગુજરાતી ಕನ್ನಡ മലയാളം ਪੰਜਾਬੀ</div>
+  </main>
+  <footer class="footer">
+    <div class="foot-row country">India</div>
+    <div class="foot-row links">
+      <div><a href="#">Advertising</a> • <a href="#">Business</a> • <a href="#">How Search works</a></div>
+      <div><a href="#">Privacy</a> • <a href="#">Terms</a> • <a href="#">Settings</a></div>
+    </div>
+  </footer>
+{% else %}
+  <!-- RESULTS -->
+  <header class="results-header">
+    <a class="brand" href="{{ url_for('index') }}" aria-label="OpenPlus Home">
+      <svg width="140" height="40" viewBox="0 0 220 72" xmlns="http://www.w3.org/2000/svg"><defs><style>.t{font:700 36px system-ui,Segoe UI,Roboto,Arial}</style></defs><text x="0" y="48" class="t" fill="#8ab4f8">Open</text><text x="110" y="48" class="t" fill="#34a853">P</text><text x="136" y="48" class="t" fill="#fbbc05">l</text><text x="146" y="48" class="t" fill="#ea4335">us</text></svg>
+    </a>
+    <form class="head-search" action="{{ url_for('search') }}" method="get" role="search" autocomplete="off">
+      <div class="box compact">
+        <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" style="fill:#bdc1c6"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.22C16 6.01 13.2 3.22 9.99 3.22S4 6.01 4 9.22s2.79 5.99 5.99 5.99a6.471 6.471 0 0 0 4.23-1.57l.27.28v.79l4.25 4.25c.41.41 1.08.41 1.49 0 .41-.41.41-1.08 0-1.49L15.5 14zM6 9.22a3.99 3.99 0 1 1 7.98 0A3.99 3.99 0 0 1 6 9.22z"/></svg>
+        <input name="q" value="{{ q }}" aria-label="Search">
+        <input type="hidden" name="t" value="{{ t }}">
+        <button type="button" class="ghost" title="Voice">🎤</button>
+        <button type="button" class="ghost" title="Image">📷</button>
+      </div>
+    </form>
+    <button class="apps" aria-label="Apps"><span class="dots"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></span></button>
+    <div class="avatar">OP</div>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Search modes">
+    {% set tabs=[('all','All'),('images','Images'),('news','News'),('videos','Videos'),('maps','Maps'),('explore','Explore')] %}
+    {% for id,label in tabs %}
+      <a class="tab {{ 'active' if t==id else '' }}" href="{{ url_for('search', q=q, t=id) }}">{{ label }}</a>
+    {% endfor %}
+    <div class="spacer"></div>
+    <span class="tools hint">Tools</span>
+  </nav>
+
+  <main class="grid">
+    <!-- LEFT rail: now visible on mobile too -->
+    <aside class="left">
+      {% if paa and paa|length>0 %}
+        <div class="card"><h3>People also ask</h3><div class="chips">{% for r in paa %}<a class="chip" href="{{ url_for('search', q=r, t='all') }}">{{ r }}</a>{% endfor %}</div></div>
+      {% endif %}
+      {% if pas and pas|length>0 %}
+        <div class="card"><h3>People also search for</h3><div class="chips">{% for r in pas %}<a class="chip" href="{{ url_for('search', q=r, t='all') }}">{{ r }}</a>{% endfor %}</div></div>
+      {% endif %}
+      {% if place %}
+        <div class="card"><h3>Map</h3><div>📍 {{ place.name }}</div><div id="map" style="height:300px;margin-top:8px;border-radius:10px;"></div>
+          <script>
+            (function(){ var map = L.map('map', { center: [{{ place.lat }}, {{ place.lon }}], zoom: 12 });
+            var esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Esri' }).addTo(map);
+            var osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' });
+            L.control.layers({"Satellite": esri, "Street": osm}).addTo(map);
+            L.marker([{{ place.lat }}, {{ place.lon }}]).addTo(map).bindPopup("{{ place.name }}"); })();
+          </script>
+        </div>
+      {% endif %}
+      {% if weather %}
+        <div class="card"><h3>Weather</h3>Temp: {{ weather.temp }} °C • Wind: {{ weather.wind }} km/h<br><small class="hint">{{ weather.time }}</small></div>
+      {% endif %}
+    </aside>
+
+    <section>
+      {% if t=='all' %}
+        {% if featured %}
+          <div class="card">
+            <h3 style="display:flex;align-items:center;gap:10px;">
+              <a href="{{ featured.url }}" target="_blank">{{ featured.title }}</a>
+              <button class="chip" onclick="speakWithIntro(document.getElementById('featured-snippet').innerText)">🔊 Read</button>
+            </h3>
+            {% if featured.image %}<img class="thumb-lg" src="{{ featured.image }}" alt="">{% endif %}
+            <p id="featured-snippet">{{ featured.snippet }}</p>
+          </div>
+        {% endif %}
+
+        {% if top_stories and top_stories|length>0 %}
+          <div class="card"><h3>Top stories</h3>
+            {% for n in top_stories %}
+              <div class="result" style="margin-bottom:8px;">
+                {% if n.thumb %}
+                  <a href="{{ n.url }}" target="_blank"><img class="thumb" src="{{ n.thumb }}" alt=""></a>
+                {% else %}
+                  <img class="site-fav" src="{{ favicon_for(n.source) }}" alt="">
+                {% endif %}
+                <div>
+                  <a href="{{ n.url }}" target="_blank"><b>{{ n.title }}</b></a><br>
+                  <small class="hint"><img class="small-fav" src="{{ favicon_for(n.source) }}"> {{ n.source }} • {{ n.time }}</small>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        {% endif %}
+
+        <div class="card">
+          {% for r in results %}
+            <div class="result" style="margin-bottom:8px;">
+              <img class="site-fav" src="{{ favicon_for(r.domain) }}" alt="">
+              <div>
+                <a href="{{ r.url }}" target="_blank"><b>{{ r.title }}</b></a><br>
+                <small class="hint">{{ r.domain }}</small>
+                <p id="snip-{{ loop.index0 }}" style="margin:6px 0 0 0;">{{ r.snippet }}</p>
+                <div class="chips"><button class="chip" onclick="speakWithIntro(document.getElementById('snip-{{ loop.index0 }}').innerText)">🔊 Read</button></div>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      {% if t=='images' %}
+        <div class="card"><h3>Images for “{{ q }}” <small class="hint">(up to 500)</small></h3></div>
+        <div class="media-grid">
+          {% for im in images %}
+            <div class="media-item">
+              <a href="{{ im.page or im.src }}" target="_blank">
+                <img src="{{ im.src }}" alt="{{ im.alt }}">
+                <div style="padding:8px">
+                  <small>{{ im.alt }}</small><br><small class="hint">{{ im.domain }}</small>
+                </div>
+              </a>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      {% if t=='videos' %}
+        <div class="card"><h3>Videos for “{{ q }}” <small class="hint">(up to 500)</small></h3></div>
+        <div class="video-list">
+          {% for v in videos %}
+            <div class="video-card">
+              <a href="{{ v.url }}" target="_blank" style="display:flex;gap:12px;color:inherit;text-decoration:none">
+                {% if v.thumb %}<img class="video-thumb" src="{{ v.thumb }}" alt="{{ v.title }}">
+                {% else %}<img class="video-thumb" src="{{ favicon_for(v.domain) }}" alt="{{ v.title }}">{% endif %}
+                <div class="video-meta">
+                  <div class="video-title"><b>{{ v.title }}</b></div>
+                  <div class="video-source"><img class="small-fav" src="{{ favicon_for(v.domain) }}"> {{ v.domain }}</div>
+                </div>
+              </a>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      {% if t=='news' %}
+        <div class="card"><h3>News about “{{ q }}”</h3></div>
+        <div>
+          {% for n in top_stories %}
+            <div class="result" style="margin-bottom:8px;">
+              {% if n.thumb %}<a href="{{ n.url }}" target="_blank"><img class="thumb" src="{{ n.thumb }}"></a>
+              {% else %}<img class="site-fav" src="{{ favicon_for(n.source) }}">{% endif %}
+              <div>
+                <a href="{{ n.url }}" target="_blank"><b>{{ n.title }}</b></a><br>
+                <small class="hint"><img class="small-fav" src="{{ favicon_for(n.source) }}"> {{ n.source }} • {{ n.time }}</small>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      {% if t=='maps' %}
+        {% if place %}
+          <div class="card"><h3>{{ place.name }}</h3><div id="map2" style="height:360px;border-radius:10px;"></div></div>
+          <script>
+            (function(){ var m = L.map('map2', { center: [{{ place.lat }}, {{ place.lon }}], zoom: 12 });
+              var esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Esri' }).addTo(m);
+              var osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' });
+              L.control.layers({"Satellite": esri, "Street": osm}).addTo(m);
+              L.marker([{{ place.lat }}, {{ place.lon }}]).addTo(m).bindPopup("{{ place.name }}"); })();
+          </script>
+        {% else %}
+          <div class="card">Type a place name to see the map.</div>
+        {% endif %}
+      {% endif %}
+
+      {% if t=='explore' %}
+        <div class="card"><h3>Explore Categories</h3><div class="chips">
+          {% for cat in categories %}<a class="chip" href="{{ url_for('explore', cat=cat, q=q) }}">{{ cat }}</a>{% endfor %}
+        </div></div>
+        {% if selected_category %}
+          <div class="card"><h3>{{ selected_category|capitalize }} — curated sources</h3>
+            {% for r in cat_results %}
+              <div class="result" style="margin-bottom:8px;">
+                <img class="site-fav" src="{{ favicon_for(r.source or r.domain) }}">
+                <div>
+                  <a href="{{ r.url }}" target="_blank"><b>{{ r.title }}</b></a><br>
+                  <small class="hint">{{ r.source or r.domain }}</small>
+                  <p style="margin:6px 0 0 0;">{{ r.snippet }}</p>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="card"><small class="hint">Tip: Select a category above. Type a query to filter within that category.</small></div>
+        {% endif %}
+      {% endif %}
+    </section>
+
+    <!-- RIGHT rail: now visible on mobile too -->
+    <aside class="right">
+      {% if about %}
+        <div class="card"><h3>About</h3>
+          {% if about.image %}<img class="thumb-lg" src="{{ about.image }}">{% endif %}
+          <p>{{ about.snippet }}</p>
+          <a href="{{ about.url }}" target="_blank">More</a>
+        </div>
+      {% endif %}
+      <div class="card"><h3>AI Lady Voice</h3><label><input id="tts-enable" type="checkbox"> Enable</label>
+        <div class="hint">Click “🔊 Read” under any snippet.</div>
+      </div>
+      <div class="card hint">OpenPlus • {{ ts }}</div>
+    </aside>
+  </main>
+
+  <footer class="footer">
+    <div class="foot-row country">India</div>
+    <div class="foot-row links">
+      <div><a href="#">Advertising</a> • <a href="#">Business</a> • <a href="#">How Search works</a></div>
+      <div><a href="#">Privacy</a> • <a href="#">Terms</a> • <a href="#">Settings</a></div>
+    </div>
+  </footer>
+{% endif %}
+
+  <script>
+    // Client-side TTS with intro (local-only voice)
+    (function(){
+      const INTRO = "Assalaamualaikum, I am OpenPlus AI. I will read the description for you.";
+      let voices=[], pref=null; window.__tts_intro=false;
+      function load(){ voices = speechSynthesis.getVoices()||[]; pref = voices.find(v=>/female|zira|amy|emma|nora|samantha/i.test((v.name||'').toLowerCase())) || voices.find(v=>v.lang&&v.lang.toLowerCase().startsWith('en')) || voices[0] || null; }
+      speechSynthesis.onvoiceschanged = load; setTimeout(load,200);
+      window.speakWithIntro = function(text){
+        try{
+          const enable = document.getElementById('tts-enable'); if (!enable || !enable.checked) return;
+          if (!text || !text.trim()) return; speechSynthesis.cancel(); load();
+          const speak = (t)=>{ const u=new SpeechSynthesisUtterance(t); if(pref)u.voice=pref; u.rate=1.0; u.pitch=1.05; u.volume=1.0; speechSynthesis.speak(u); };
+          if(!window.__tts_intro){ window.__tts_intro=true; const u=new SpeechSynthesisUtterance(INTRO); if(pref)u.voice=pref; u.onend=()=>setTimeout(()=>speak(text),120); speechSynthesis.speak(u); }
+          else speak(text);
+        }catch(e){ console.warn("TTS error",e); }
+      };
+      document.addEventListener('keydown', e=>{ if(e.key==='Escape') speechSynthesis.cancel(); });
+    })();
+  </script>
+</body>
+</html>
+"""
+
+@app.template_filter("domain_from_url")
+def _jinja_domain_filter(u: str) -> str:
+    return domain_from_url(u)
+
+@app.template_filter("urlencode")
+def _jinja_urlencode(s: str) -> str:
+    return quote_plus(s or "")
+
+@app.context_processor
+def inject_helpers():
+    return {"favicon_for": lambda d: f"https://icons.duckduckgo.com/ip3/{(d or '').strip()}.ico"}
+
+# -------------------- Routes --------------------
+
+
+@app.route("/")
+def index():
+    q = (request.args.get("q") or "").strip()
+    if q:
+        return redirect(url_for("search", q=q))
+    return render_template_string(
+        HTML,
+        q="",
+        t="all",
+        results=[],
+        featured=None,
+        top_stories=[],
+        paa=[],
+        pas=[],
+        images=[],
+        videos=[],
+        place=None,
+        weather=None,
+        categories=sorted(CATEGORIES.keys()),
+        selected_category=None,
+        cat_results=[],
+        about=None,
+        ts=datetime.now().strftime("%Y-%m-%d %H:%M"),
+    )
+
+
+@app.route("/lucky")
+def lucky():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return redirect(url_for("index"))
+    return redirect(f"https://www.google.com/search?btnI=1&q={quote_plus(q)}")
+
+
+@app.route("/search")
+def search():
+    q = (request.args.get("q") or "").strip()
+    t = (request.args.get("t") or "all").lower()
+
+    results: List[Dict[str, Any]] = []
+    featured = None
+    paa: List[str] = []
+    pas: List[str] = []
+    images: List[Dict[str, str]] = []
+    videos: List[Dict[str, str]] = []
+    top_stories: List[Dict[str, str]] = []
+    place = None
+    weather = None
+    about = None
+
+    if q:
+        try:
+            top_stories = ddg_news(q, limit=20)
+        except Exception:
+            top_stories = []
+
+        if t == "images":
+            images = ddg_images(q, limit=500)
+        if t == "videos":
+            videos = ddg_videos(q, limit=500)
+        if t in ("maps", "all"):
+            place = geocode(q)
+            weather = get_weather(place["lat"], place["lon"]) if place else None
+        if t == "all":
+            results = ddg_search(q, limit=12)
+            featured = pick_featured(q, results) if results else None
+            suggs = ddg_suggestions(q, limit=16)
+            pas = suggs[:8]
+            paa = build_people_also_ask(q, suggs, limit=6)
+            # Right-rail about
+            about = featured or (results[1] if len(results) > 1 else None)
+
+    return render_template_string(
+        HTML,
+        q=q,
+        t=t,
+        results=results,
+        featured=featured,
+        top_stories=top_stories,
+        paa=paa,
+        pas=pas,
+        images=images,
+        videos=videos,
+        place=place,
+        weather=weather,
+        categories=sorted(CATEGORIES.keys()),
+        selected_category=None,
+        cat_results=[],
+        about=about,
+        ts=datetime.now().strftime("%Y-%m-%d %H:%M"),
+    )
+
+
+@app.route("/explore")
+def explore():
+    q = (request.args.get("q") or "").strip()
+    cat = (request.args.get("cat") or "").strip().lower()
+    cat_results = category_aggregate(cat, q, per_domain=3, max_results=50) if cat else []
+    return render_template_string(
+        HTML,
+        q=q,
+        t="explore",
+        results=[],
+        featured=None,
+        top_stories=[],
+        paa=[],
+        pas=[],
+        images=[],
+        videos=[],
+        place=None,
+        weather=None,
+        categories=sorted(CATEGORIES.keys()),
+        selected_category=cat if cat in CATEGORIES else None,
+        cat_results=cat_results,
+        about=None,
+        ts=datetime.now().strftime("%Y-%m-%d %H:%M"),
+    )
+
+
+@app.route("/api/search")
+def api_search():
+    q = (request.args.get("q") or "").strip()
+    t = (request.args.get("t") or "all").lower()
+    out: Dict[str, Any] = {"q": q, "t": t}
+    if not q:
+        return jsonify({**out, "results": []})
+    if t == "images":
+        return jsonify({**out, "images": ddg_images(q, limit=500)})
+    if t == "videos":
+        return jsonify({**out, "videos": ddg_videos(q, limit=500)})
+    if t == "news":
+        return jsonify({**out, "news": ddg_news(q, limit=20)})
+    if t == "maps":
+        loc = geocode(q)
+        w = get_weather(loc["lat"], loc["lon"]) if loc else None
+        return jsonify({**out, "place": loc, "weather": w})
+    results = ddg_search(q, limit=12)
+    featured = pick_featured(q, results) if results else None
+    suggs = ddg_suggestions(q, limit=12)
+    paa = build_people_also_ask(q, suggs, limit=6)
+    pas = suggs[:8]
+    return jsonify(
+        {
+            **out,
+            "featured": featured,
+            "people_also_ask": paa,
+            "people_also_search": pas,
+            "results": results,
+        }
+    )
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify(ok=True, ts=now_s())
+
+
+# -------------------- Run --------------------
+
+
+def _run_server(host: str = "0.0.0.0", port: int = 5000, debug: bool = False):
+    app.run(host=host, port=port, debug=debug)
+
+
+def main():
+    p = argparse.ArgumentParser(description="OpenPlus Web (Flask, single file)")
+    p.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    p.add_argument("--port", type=int, default=int(os.environ.get("PORT", 5000)))
+    p.add_argument("--debug", action="store_true", default=False)
+    args = p.parse_args()
+    _run_server(args.host, args.port, args.debug)
+
+
+if __name__ == "__main__":
+    main()
